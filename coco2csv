@@ -4,43 +4,60 @@ This script downloads COCO descriptions according to https://files.assecobs.pl/s
 On default script will try to work recusively for zipped file.  
 If it fails it will try to treat downloaded file as single json
 """
+import itertools
 import os
 import sys
+import time
 import json
 import requests
 import logging
-import pandas as pd
 import argparse
+import pandas as pd
 
+from tqdm import tqdm
 from json.decoder import JSONDecodeError
 from io import BytesIO
 from zipfile import ZipFile, BadZipFile
 
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 logger = logging.getLogger(__name__)
-FORMAT = "[%(asctime)s] %(message)-25s [%(funcName)s():%(filename)8s:%(lineno)s]"
-logging.basicConfig(format=FORMAT)
 
 def download_file(url: str) -> bytes:
+    """Prints progressbar while downloading file"""
     logger.info("Download starting...")
-    response = requests.get(url)
+    response = requests.get(url, stream=True)
     if response.status_code != 200:
         logger.critical("Error while downloading file HTTP:%s", response.status_code)
         sys.exit(-1)
-    else: logger.info("File downloaded")
-    return response.content
+    else:
+        content = bytearray()
+        total_size_in_bytes = int(response.headers.get('content-length', 0))
+        block_size = 1024 #1 Kibibyte
+        progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
+        for data in response.iter_content(block_size):
+            progress_bar.update(len(data))
+            content.extend(data)
+            time.sleep(0.0000001)
+        progress_bar.close()
+        logger.info("File downloaded")
+        return content
 
 def get_zipped_json(file_content: bytes) -> tuple:
+    """unzippes json in memory"""
     try:
         zip_file = ZipFile(BytesIO(file_content))
         for file_name in zip_file.namelist():
-            data = json.load(zip_file.open(file_name))
-            yield file_name,data
+            if file_name.lower().endswith(".json"):
+                data = json.load(zip_file.open(file_name))
+                yield file_name,data
 
     except BadZipFile:
         logger.debug("Provided file is not zipped, trying to extract json directly")
         yield get_unzipped_json(file_content)
 
 def get_unzipped_json(file_content: bytes) -> tuple:
+    """tries to read bytes as json"""
     file_name = "coco_transformed.json"
     try:
         data = json.loads(file_content.decode('utf-8'))
@@ -49,7 +66,7 @@ def get_unzipped_json(file_content: bytes) -> tuple:
         sys.exit(-1)
     return file_name,data
 
-def transform_coco(data) -> pd.DataFrame:
+def transform_coco(data: dict) -> pd.DataFrame:
     # select all images out of given dataset
     df_images = pd.DataFrame(data['images'])
     df_images = df_images.set_index('id')
@@ -100,38 +117,58 @@ def transform_coco(data) -> pd.DataFrame:
     df_to_export.drop_duplicates(inplace=True)
     return df_to_export
 
-def parse_arguments():
+def save_csv(df: pd.DataFrame, destination_dir: str, file_name:str) -> None:
+    """preserves downloaded zip structure by creating directories if they doesn't exists"""
+    path_to_save = destination_dir + file_name
+    if os.path.isdir(os.path.dirname(path_to_save)) == False:
+        os.makedirs(os.path.dirname(path_to_save), exist_ok=True)
+    df.to_csv(path_to_save)
+    logger.info("Saved at %s", path_to_save)
+
+def parse_arguments()->dict:
     parser = argparse.ArgumentParser(description="This script downloads dataset in COCO format from url, and exports it to .csv")
-    parser.add_argument('-s',"--source-url", metavar="source_url", help="url with data in coco format", default="http://localhost:8000/test.json") #TMP add required =True
-    parser.add_argument('-d',"--destination", metavar="destination", help="path to save result files")    
+    parser.add_argument('-s',"--source-url", metavar="source_url", help="url with data in coco format", required=True) #TMP add required =True
+    parser.add_argument('-d',"--destination-path", metavar="destination_path", help="path to save result files", required=True)    
     parser.add_argument('-v',"--verbosity", metavar="verbosity", help="Verbosity of logging: 0 - critical, 1 - error, 2 - warning, 3 - info, 4 - debug. Default: info", default = 3)
-    
+       
     verbosity = {0: logging.CRITICAL, 1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}
+    DEB_LOG_FORMAT = "[%(asctime)s] %(message)-20s [%(funcName)s():%(filename)8s:%(lineno)s]"
+    USR_LOG_FORMAT = "%(message)s"
+
     args = vars(parser.parse_args())
+    logger.setLevel(verbosity[int(args['verbosity'])])
+    logging.basicConfig(format=DEB_LOG_FORMAT if verbosity[int(args['verbosity'])] == logging.DEBUG else USR_LOG_FORMAT)
+    
 
-    if args['destination'][-1] != "/":
-        args['destination'] += "/"
+    if args['destination_path'] and args['destination_path'][-1] != "/":
+        args['destination_path'] += "/"
 
-    logger.setLevel(verbosity[args['verbosity']])
     return args
 
 def main():
-    logger.debug("Started %s", os.path.basename(sys.argv[0]))
+    logger.info("Started %s", os.path.basename(sys.argv[0]))
     args = parse_arguments()
-    logger.info(args)
     coco_url = args['source_url']
-    destination_dir = args['destination']
-
+    destination_dir = args['destination_path']
     content = download_file(coco_url)
     coco_data_generator = get_zipped_json(content)
-    for file_name, data in coco_data_generator:
-        try:
-            df = transform_coco(data)
-        except KeyError:
-            logger.error("Unsupported format in %s, skipping...", file_name)
-            continue
-        path_to_save = destination_dir + file_name
-        df.to_csv(path_to_save)
-        logger.info("Saved at %s", path_to_save)
+    logger.info("Prepearing to transform...", )
+    coco_data_generator, coco_generator = itertools.tee(coco_data_generator)
+    coco_generator_len = sum(1 for _ in coco_generator)
+    logger.info("Transforming data...", )
+
+    #progress bar keeping new logs on top in bash
+    with logging_redirect_tqdm():
+        with tqdm(total=coco_generator_len) as progress_bar:
+            for file_name, data in coco_data_generator:
+                progress_bar.update(1)
+                try:
+                    df = transform_coco(data)
+                except KeyError:
+                    logger.error("Unsupported format in %s, skipping...", file_name)
+                    continue
+                save_csv(df, destination_dir, file_name)
+    
+            
 if __name__ == '__main__':
     main()
