@@ -38,7 +38,7 @@ def download_file(url: str) -> bytes:
         for data in response.iter_content(block_size):
             progress_bar.update(len(data))
             content.extend(data)
-            time.sleep(0.0000001)
+            time.sleep(0.000001) #yields network for another processes
         progress_bar.close()
         logger.info("File downloaded")
         return content
@@ -122,7 +122,8 @@ def save_csv(df: pd.DataFrame, destination_dir: str, file_name:str) -> None:
     path_to_save = destination_dir + file_name
     if os.path.isdir(os.path.dirname(path_to_save)) == False:
         os.makedirs(os.path.dirname(path_to_save), exist_ok=True)
-    df.to_csv(path_to_save)
+    path_to_save = os.path.splitext(path_to_save)[0] + ".csv" #replace extension
+    df.to_csv(path_to_save, index=False)
     logger.info("Saved at %s", path_to_save)
 
 def parse_arguments()->dict:
@@ -168,7 +169,6 @@ def main():
                     logger.error("Unsupported format in %s, skipping...", file_name)
                     continue
                 save_csv(df, destination_dir, file_name)
-    
-            
+                
 if __name__ == '__main__':
     main()
