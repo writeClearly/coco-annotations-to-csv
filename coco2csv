@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+This script downloads COCO annotations extracts image features description and exports them to .csv
+On default script will try to work recusively for a zipped file.  
+If it fails it will try to treat downloaded file as single json
+"""
+import os
+import sys
+import time
+import json
+import requests
+import logging
+import argparse
+import itertools
+import pandas as pd
+
+
+from io import BytesIO
+from tqdm import tqdm
+from zipfile import ZipFile, BadZipFile
+from json.decoder import JSONDecodeError
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+logger = logging.getLogger(__name__)
+
+def download_file(url: str) -> bytes:
+    """Prints progressbar while downloading file"""
+    logger.info("Download starting...")
+    response = requests.get(url, stream=True)
+    if response.status_code != 200:
+        logger.critical("Error while downloading file HTTP:%s", response.status_code)
+        sys.exit(-1)
+    else:
+        content = bytearray()
+        total_size_in_bytes = int(response.headers.get('content-length', 0))
+        block_size = 1024 #1 Kibibyte
+        progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
+        for data in response.iter_content(block_size):
+            progress_bar.update(len(data))
+            content.extend(data)
+            time.sleep(0.000001) #yields network for another processes
+        progress_bar.close()
+        logger.info("File downloaded")
+        return content
+
+def get_zipped_json(file_content: bytes) -> tuple:
+    """unzippes json in memory"""
+    try:
+        zip_file = ZipFile(BytesIO(file_content))
+        for file_name in zip_file.namelist():
+            if file_name.lower().endswith(".json"):
+                data = json.load(zip_file.open(file_name))
+                yield file_name,data
+
+    except BadZipFile:
+        logger.debug("Provided file is not zipped, trying to extract json directly")
+        yield get_unzipped_json(file_content)
+
+def get_unzipped_json(file_content: bytes) -> tuple:
+    """tries to read bytes as json"""
+    file_name = "coco_transformed.json"
+    try:
+        data = json.loads(file_content.decode('utf-8'))
+    except JSONDecodeError:
+        logger.critical("Unable to convert downloaded file to JSON, shutdowning... \nAre you sure that url is correct?")
+        sys.exit(-1)
+    return file_name,data
+
+def transform_coco(data: dict) -> pd.DataFrame:
+    # select all images out of given dataset
+    df_images = pd.DataFrame(data['images'])
+    df_images = df_images.set_index('id')
+    df_images.index.names = ['image_id'] #for merging readability later
+
+    # pull off image metadata
+    df_images_info =  pd.DataFrame(df_images[["file_name","width","height","coco_url"]])
+    df_images_info.columns = ["image_name","image_width","image_height","image_url"]
+
+    # all possible image descriptions eg. bounding boxes
+    df_annotations = pd.DataFrame(data['annotations'])
+    df_annotations = df_annotations.set_index('image_id')
+
+    # extract category_id out of each annotation for labeling later
+    df_annotations_category_id = pd.DataFrame(df_annotations["category_id"])
+
+    # done to keep image_id as primary key for relationship between images and annotations
+    df_annotations_category_id.reset_index(inplace=True)
+    df_annotations_category_id.set_index('category_id', inplace=True)
+
+    # extract all possible categories of objects present at image eg. persons
+    df_categories = pd.DataFrame(data['categories'], columns=["id","name"])
+    df_categories.set_index('id', inplace=True)
+
+    df_images_category_name = df_annotations_category_id.join(df_categories)
+    df_images_category_name.set_index('image_id', inplace=True)
+    df_images_category_name.columns = ["label"]
+
+    # pull off image border box coordinates
+    df_bbox = pd.DataFrame(df_annotations['bbox'].values.tolist(), columns=["x","y","width","height"], index=df_annotations.index)
+
+    # calculate missing bbox corners
+    df_xmax = pd.DataFrame(df_bbox["x"] + df_bbox["width"], columns = ["x_max"], index=df_annotations.index)
+    df_ymin = pd.DataFrame(df_bbox["y"] - df_bbox["height"], columns = ["y_min"],index=df_annotations.index)
+
+    # concatenate image corners location
+    df_coords = pd.concat([df_bbox["x"], df_ymin, df_xmax, df_bbox["y"]], axis=1)
+    df_coords.columns = ["x_min","y_min","x_max","y_max"]
+
+    # merge all dataframes to one
+    df_labeled_with_info = pd.merge(df_images_category_name, df_images_info, on=['image_id'])
+    df_to_export = pd.merge(df_labeled_with_info, df_coords, on=['image_id'])
+
+    # ensuring that columns order is as requested, you can safely change columns order below 
+    # !WARNING! may be computation expensive - could alsoe be done also by single poping/inserting - only image_url is not at position
+    final_columns_order = ["label","image_name","image_width","image_height","x_min","y_min","x_max","y_max","image_url"]
+    df_to_export = df_to_export.reindex(columns = final_columns_order, copy=False)
+    df_to_export.drop_duplicates(inplace=True)
+    return df_to_export
+
+def save_csv(df: pd.DataFrame, destination_dir: str, file_name:str) -> None:
+    """preserves downloaded zip structure by creating directories if they doesn't exists"""
+    path_to_save = destination_dir + file_name
+    if os.path.isdir(os.path.dirname(path_to_save)) == False:
+        os.makedirs(os.path.dirname(path_to_save), exist_ok=True)
+    path_to_save = os.path.splitext(path_to_save)[0] + ".csv" #replace extension
+    df.to_csv(path_to_save)
+    logger.info("Saved at %s", path_to_save)
+
+def parse_arguments()->dict:
+    parser = argparse.ArgumentParser(description="This script downloads dataset in COCO format from url, and exports it to .csv")
+    parser.add_argument('-s',"--source-url", metavar="source_url", help="url with data in coco format", required=True) #TMP add required =True
+    parser.add_argument('-d',"--destination-path", metavar="destination_path", help="path to save result files", required=True)    
+    parser.add_argument('-v',"--verbosity", metavar="verbosity", help="Verbosity of logging: 0 - critical, 1 - error, 2 - warning, 3 - info, 4 - debug. Default: info", default = 3)
+       
+    verbosity = {0: logging.CRITICAL, 1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}
+    DEB_LOG_FORMAT = "[%(asctime)s] %(message)-20s [%(funcName)s():%(filename)8s:%(lineno)s]"
+    USR_LOG_FORMAT = "%(message)s"
+
+    args = vars(parser.parse_args())
+    logger.setLevel(verbosity[int(args['verbosity'])])
+    logging.basicConfig(format=DEB_LOG_FORMAT if verbosity[int(args['verbosity'])] == logging.DEBUG else USR_LOG_FORMAT)
+    
+
+    if args['destination_path'] and args['destination_path'][-1] != "/":
+        args['destination_path'] += "/"
+
+    return args
+
+def main():
+    logger.info("Started %s", os.path.basename(sys.argv[0]))
+    args = parse_arguments()
+    coco_url = args['source_url']
+    destination_dir = args['destination_path']
+    content = download_file(coco_url)
+    coco_data_generator = get_zipped_json(content)
+    logger.info("Prepearing to transform...", )
+    coco_data_generator, coco_generator = itertools.tee(coco_data_generator)
+    coco_generator_len = sum(1 for _ in coco_generator)
+    logger.info("Transforming data...", )
+
+    #progress bar keeping new logs on top in bash
+    with logging_redirect_tqdm():
+        with tqdm(total=coco_generator_len) as progress_bar:
+            for file_name, data in coco_data_generator:
+                progress_bar.update(1)
+                try:
+                    df = transform_coco(data)
+                except KeyError:
+                    logger.error("Unsupported format in %s, skipping...", file_name)
+                    continue
+                save_csv(df, destination_dir, file_name)
+                
+if __name__ == '__main__':
+    main()
